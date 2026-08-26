@@ -1,0 +1,415 @@
+# ============================================================================
+#  n8n — https://n8n.example.com
+#  Server OVH (migrat recent de pe AWS).
+#
+#  Acest fișier este un snapshot fidel al containerului care rulează efectiv
+#  la 2026-07-27, generat din `docker inspect n8n`. Nu schimbă comportamentul:
+#  un `docker compose up -d` recreează exact containerul actual.
+#
+#  ATENȚIE LA PRIMA APLICARE — containerul curent a fost pornit cu `docker run`,
+#  nu cu Compose, deci nu are label-urile de proiect. Compose nu îl poate
+#  adopta din mers; va da eroare de nume ocupat. Preluarea se face așa:
+#
+#      docker stop n8n && docker rm n8n     # datele NU se pierd
+#      docker compose up -d
+#
+#  Downtime: câteva secunde. Volumul n8n_data (39 MB — database.sqlite plus
+#  cheia de criptare) rămâne intact și e re-atașat noului container.
+#
+#  Singura diferență față de starea actuală: containerul trece de pe rețeaua
+#  `bridge` implicită pe una proprie proiectului (n8n-stack_default), pentru că
+#  așa lucrează Compose. Nu contează aici — nginx merge prin portul publicat pe
+#  host, nu prin IP-ul de container, iar altceva nu rulează în Docker.
+#
+#  nginx NU face parte din acest stack: rulează pe host, sub systemd, cu
+#  certificat Let's Encrypt și redirect 80 -> 443. Copie de referință a
+#  configului live: ./nginx/n8n.conf
+# ============================================================================
+
+name: n8n-stack
+
+services:
+  n8n:
+    # Tag-ul `:latest` rezolva la 2.31.7 la data snapshot-ului. Pinuit explicit
+    # ca versiunea sa nu se schimbe la un `docker compose pull` neatent.
+    # Digest-ul exact al imaginii care rulează acum:
+    #   sha256:e6bc77c3ace603bb66a1cf805756041986f721bfb8e1c1b88721e6f1b9d89c2a
+    image: docker.n8n.io/n8nio/n8n:2.31.7
+    container_name: n8n
+    restart: unless-stopped
+
+    # Docker trimite SIGKILL dupa 10s implicit, inainte ca n8n sa apuce sa
+    # goleasca execuțiile în curs. De cand exista gruparea mesajelor, fiecare
+    # conversație stă 25s într-o fereastră de așteptare, deci fiecare deploy
+    # omora ~10 conversații la mijloc — oamenii vedeau "Seen" și niciun răspuns.
+    # 45s acoperă fereastra de 25s plus marjă.
+    stop_grace_period: 45s
+
+    ports:
+      # Legat pe loopback. nginx face proxy_pass către localhost:5678, deci e
+      # echivalent funcțional cu publicarea pe 0.0.0.0, dar portul nu mai există
+      # de pe internet.
+      #
+      # Închis pe 2026-07-27. Înainte era "5678:5678", iar
+      # http://203.0.113.10:5678/ întorcea 200 cu pagina de login completă
+      # (22 KB), în HTTP simplu, ocolind și Cloudflare, și nginx, și TLS-ul.
+      # ufw este inactiv pe host, deci nimic altceva nu bloca portul.
+      - "127.0.0.1:5678:5678"
+      #
+      # Rămâne separat de rezolvat faptul că nginx însuși e accesibil pe IP-ul
+      # brut: https://203.0.113.10/ întoarce 200, fiindcă blocul e singurul
+      # site activ, deci și default_server, și prinde orice Host. Cloudflare
+      # ascunde originea doar dacă originea nu răspunde direct — altfel WAF-ul
+      # și rate limiting-ul de la CDN se ocolesc trivial. Fix: filtrarea
+      # porturilor 80/443 la nivel de firewall, doar către rangeurile
+      # Cloudflare (https://www.cloudflare.com/ips/).
+
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+    # Adăugat față de containerul actual (care nu are healthcheck). Nu schimbă
+    # comportamentul n8n, doar îi dă lui Docker un semnal de stare.
+    # `wget` există în imagine (busybox), /healthz întoarce {"status":"ok"}.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5678/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    # --- Variabile de mediu --------------------------------------------------
+    # Adăugate pe 2026-07-27. Containerul original (de pe AWS, apoi primul de pe
+    # OVH) nu avea niciuna setată, deci n8n raporta http://localhost:5678 ca URL
+    # public. Asta NU a afectat webhook-urile primite — acelea sunt rutate de
+    # nginx după path și mergeau (2682 execuții reușite în ziua respectivă).
+    # Afectează URL-urile pe care n8n le *generează*: ce copiezi din editor,
+    # $execution.resumeUrl, URL-uri de Form/Chat trigger.
+    #
+    # N8N_PROTOCOL=https descrie doar cum se prezintă n8n în exterior; TLS-ul
+    # rămâne terminat de nginx. n8n continuă să servească HTTP simplu pe 5678
+    # (ar avea nevoie de N8N_SSL_KEY/N8N_SSL_CERT ca să facă TLS el însuși).
+    environment:
+      - N8N_HOST=n8n.example.com
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://n8n.example.com/
+      - N8N_EDITOR_BASE_URL=https://n8n.example.com
+      - N8N_SECURE_COOKIE=true
+
+      # Fus orar. Fără GENERIC_TIMEZONE, n8n folosea America/New_York — valoare
+      # hardcodată în @n8n/config/dist/configs/generic.config.js, nu moștenită
+      # de la host (hostul e pe UTC). Se vedea direct în n8nEventLog: toate
+      # timestamp-urile erau pe -04:00.
+      #
+      # GENERIC_TIMEZONE decide când se declanșează trigger-ele Schedule/Cron.
+      # Pentru automatizări de business vrei ora locală: "rulează la 9" trebuie
+      # să însemne 9 dimineața aici, nu 9 UTC (adică 12 vara).
+      # TZ setează fusul sistemului din container — timestamp-urile din loguri.
+      #
+      # Aplicat pe 2026-07-27, când instanța nu avea încă niciun trigger
+      # programat și niciun workflow cu expresii de dată — deci schimbarea
+      # n-a modificat nicio logică existentă, doar citirea logurilor.
+      - GENERIC_TIMEZONE=Europe/Bucharest
+      - TZ=Europe/Bucharest
+
+      # Reținerea datelor de execuție. Implicit n8n salvează payload-ul complet
+      # al FIECĂREI execuții reușite. La ~2700 conversații/zi cu răspunsuri AI
+      # (~15 KB fiecare) baza creștea cu ~15 MB/oră — 14,7 MB la 10:07 devenise
+      # 50 MB la 12:28 în aceeași zi. Exact problema care dusese baza la 148 MB
+      # pe serverul vechi. Erorile rămân salvate, ca să fie depanabile.
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=none
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+
+      # Curățare automată. SAVE_ON_SUCCESS=none singur NU e suficient de când
+      # există gruparea mesajelor: execuțiile care trec printr-un nod Wait
+      # trebuie persistate ca să poată fi reluate, iar ștergerea-la-succes nu
+      # le mai recuperează. Rezultatul măsurat pe 2026-07-27: 28.061 execuții
+      # reușite stocate în ~7 ore, 652 MB, adică ~93 MB/oră — 2,2 GB pe zi.
+      #
+      # Astea două pun un plafon dur, independent de comportamentul de mai sus.
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=24
+      - EXECUTIONS_DATA_PRUNE_MAX_COUNT=5000
+
+      # Limitează execuțiile simultane. Implicit e -1 (nelimitat); pe 27 iulie
+      # s-au observat 194 de execuții concurente într-un vârf de trafic, ceea ce
+      # pe o cutie de 3,7 GiB cu 2 vCPU e felul în care rămâi fără memorie.
+      - N8N_CONCURRENCY_PRODUCTION_LIMIT=10
+
+      # Un singur hop, pentru că nginx rezolvă el clientul real înainte să
+      # trimită mai departe. Lanțul e client -> Cloudflare -> nginx -> n8n, deci
+      # ar părea că trebuie 2 — dar /etc/nginx/conf.d/cloudflare-realip.conf
+      # face nginx să citească CF-Connecting-IP și să înlocuiască $remote_addr
+      # cu clientul real. n8n primește apoi un singur X-Forwarded-For, curat.
+      #
+      # De ce e sigur chiar dacă originea răspunde încă pe IP brut: nginx
+      # acceptă CF-Connecting-IP DOAR de la rangeurile Cloudflare, iar
+      # X-Forwarded-For e setat pe $remote_addr (suprascris), nu adăugat la ce
+      # trimite clientul. Cine lovește originea direct cu un antet inventat îl
+      # vede suprascris cu propriul IP.
+      - N8N_PROXY_HOPS=1
+
+      # Cat asteapta n8n executiile in curs la SIGTERM. Trebuie sub
+      # stop_grace_period, altfel Docker taie oricum.
+      - N8N_GRACEFUL_SHUTDOWN_TIMEOUT=40
+
+      # --- Baza de date: Postgres, migrat de pe SQLite pe 2026-07-27 ---------
+      # SQLite nu poate fi partajat între procesul principal și workeri, deci
+      # Postgres e o precondiție pentru queue mode, nu o preferință.
+      #
+      # Volumul n8n_data rămâne montat și NEATINS: database.sqlite e încă acolo,
+      # complet. Revenirea înseamnă doar comentarea acestor șase linii și un
+      # `docker compose up -d` — de asta migrarea e reversibilă în ~15 secunde.
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD:?lipsește din .env}
+
+      # Dimensiunea pool-ului de conexiuni. Implicit e 2 — nu 2 pe execuție, 2
+      # pe TOT procesul. Cu 2 conexiuni și un timeout de 20s la obținerea unei
+      # conexiuni, orice vârf de trafic pune execuțiile la coadă pe pool, iar
+      # cele care așteaptă peste 20s mor cu "timeout exceeded when trying to
+      # connect".
+      #
+      # Exact asta s-a întâmplat pe 2026-07-30 la 13:10 și 13:57 (ora locală),
+      # când traficul a urcat de la ~1 execuție/oră la ~7.000-14.000/oră după
+      # adăugarea a 30 de pagini noi: 1.698 timeout-uri de conexiune și 410
+      # webhook-uri Facebook picate — adică 410 oameni care au scris și n-au
+      # primit niciun răspuns. Printre victime a fost și un ciclu de hard-delete
+      # al execuțiilor, care a picat cu aceeași eroare la 13:10.
+      #
+      # 8 pentru instanța principală: ea nu execută workflow-uri, doar acceptă
+      # webhook-uri, servește UI-ul și rulează pruning-ul.
+      - DB_POSTGRESDB_POOL_SIZE=8
+
+      # Hard-delete la fiecare minut, nu la 15 (implicit).
+      #
+      # Pruning-ul FUNCȚIONEAZĂ — măsurat pe 2026-07-30: un ciclu a șters 3.525
+      # de rânduri dintr-o trecere. Problema e granularitatea. Ștergerea merge
+      # în loturi de 100 care se re-programează la 1s cât timp lotul e plin,
+      # deci debitul e mare, dar între cicluri stă 15 minute degeaba. La ~7.000
+      # execuții/oră asta însemna restanțe de ordinul miilor și o bază care a
+      # ajuns la 1,16 GB — din care 1,1 GB era execution_data, aproape tot
+      # rânduri deja marcate pentru ștergere.
+      #
+      # Un minut ține restanța la ~120 de rânduri în loc de ~1.750, iar dacă un
+      # ciclu pică (vezi mai sus), recuperarea vine în 60 de secunde, nu în 15
+      # minute.
+      - EXECUTIONS_DATA_PRUNE_HARD_DELETE_INTERVAL=1
+
+      # Cheia de criptare, explicit. n8n o citește în mod normal din
+      # /home/node/.n8n/config, dar workerul din queue mode primește propriul
+      # volum și trebuie să o primească pe această cale. Trebuie să fie
+      # IDENTICĂ peste tot: dacă workerul își generează una nouă, credențialele
+      # stocate devin nedecriptabile definitiv.
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY:?lipsește din .env}
+
+      # --- Queue mode -------------------------------------------------------
+      # Instanța principală nu mai execută nimic: primește webhook-urile, pune
+      # joburile în Redis, servește UI-ul. Execuția se face în `n8n-worker`.
+      # Scalarea înseamnă `docker compose up -d --scale n8n-worker=N`.
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - QUEUE_BULL_REDIS_PORT=6379
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    # Adăugat pe 2026-07-30. Până atunci instanța principală era singurul
+    # container fără plafon de memorie: pe o cutie de 3,7 GiB fără swap, o
+    # scurgere aici înseamnă OOM killer pe host, care poate lua Postgres în loc
+    # de n8n. Bugetul total al stivei devine 1,2 + 1 + 0,64 + 0,19 = 3,03 GiB,
+    # lăsând ~700 MiB pentru sistem și nginx.
+    #
+    # 1,2 GiB e cu marjă față de consumul observat (568 MiB la ~14.000
+    # execuții/oră).
+    deploy:
+      resources:
+        limits:
+          memory: 1.2G
+
+  # ==========================================================================
+  #  Worker — procesul care execută efectiv workflow-urile.
+  #
+  #  Ridicat pe 2026-07-27. Motivul migrării de pe AWS: cutia veche de 908 MB
+  #  nu avea RAM pentru asta.
+  #
+  #  ATENȚIE — N8N_ENCRYPTION_KEY trebuie să fie IDENTICĂ cu cea a instanței
+  #  principale. Workerul are propriul volum, deci nu poate citi cheia din
+  #  /home/node/.n8n/config al instanței principale; o primește din .env. Dacă
+  #  lipsește, workerul își generează una nouă la pornire și credențialele
+  #  stocate devin nedecriptabile definitiv.
+  #
+  #  --concurrency=50, ridicat de la 10 pe 2026-07-27 odată cu gruparea
+  #  mesajelor. Motivul: nodul Wait ține execuția în memorie sub 65 de secunde
+  #  (peste acest prag n8n o salvează și eliberează slotul). Fereastra de
+  #  grupare e de 25s, deci fiecare conversație ocupă un slot 25 de secunde,
+  #  nu ~2s ca înainte.
+  #
+  #  Socoteala: la vârf de 60 mesaje/minut, în cel mai rău caz toate de la
+  #  utilizatori diferiți, concurența necesară e 60/60 x 25 = 25 de sloturi.
+  #  Cu 10 s-ar fi format coadă, iar "seen" și "typing" ar fi apărut târziu —
+  #  adică exact efectul invers celui dorit. 50 lasă dublu față de cel mai
+  #  rău caz. Execuțiile care așteaptă consumă memorie, nu CPU.
+  # ==========================================================================
+  n8n-worker:
+    image: docker.n8n.io/n8nio/n8n:2.31.7
+    restart: unless-stopped
+    command: worker --concurrency=50
+    stop_grace_period: 45s
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD:?lipsește din .env}
+      # 16 aici, nu 8: workerul e cel care execută efectiv, iar fiecare
+      # conversație face 5 interogări Postgres (Buffer Message, Claim Batch,
+      # Collect Batch, plus citirea și scrierea memoriei de chat). Cu
+      # --concurrency=50, în vârf sunt 50 de execuții care se bat pe pool.
+      #
+      # Interogările sunt scurte (~2ms), deci 16 conexiuni acoperă cu mult
+      # necesarul mediu; rostul lor e să absoarbă vârfurile simultane, nu
+      # debitul mediu.
+      #
+      # ATENȚIE la `--scale n8n-worker=N`: fiecare replică deschide propriul
+      # pool de 16. Socoteala trebuie să încapă în max_connections al lui
+      # Postgres (40): 8 principal + 16 x N workeri + câteva pentru psql.
+      # Peste 2 workeri, ridică și max_connections.
+      - DB_POSTGRESDB_POOL_SIZE=16
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY:?lipsește din .env}
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - N8N_GRACEFUL_SHUTDOWN_TIMEOUT=40
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=none
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=24
+      - EXECUTIONS_DATA_PRUNE_MAX_COUNT=5000
+      - GENERIC_TIMEZONE=Europe/Bucharest
+      - TZ=Europe/Bucharest
+      # Workerul generează URL-uri (resumeUrl etc.) la fel ca instanța
+      # principală, deci are nevoie de aceeași identitate publică.
+      - N8N_HOST=n8n.example.com
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://n8n.example.com/
+      - N8N_EDITOR_BASE_URL=https://n8n.example.com
+    volumes:
+      # Volum propriu, separat de n8n_data — workerul nu trebuie să atingă
+      # fișierele SQLite ale instanței principale (păstrate pentru rollback).
+      - n8n_worker_data:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ==========================================================================
+  #  Postgres — baza n8n după migrarea de pe SQLite.
+  #
+  #  Adăugat pe 2026-07-27. Rulează în paralel cu n8n încă pe SQLite; comutarea
+  #  se face separat, după ce migrarea e verificată. Postgres e obligatoriu
+  #  pentru queue mode: SQLite nu poate fi partajat între procesul principal și
+  #  workeri.
+  #
+  #  Acordaj pentru ACEASTĂ cutie: 3,7 GiB RAM / 2 vCPU — nu 4 GiB cum
+  #  presupunea planul scris pe serverul vechi. shared_buffers coborât de la
+  #  192 MB la 128 MB, ca să rămână loc pentru n8n plus un worker.
+  #
+  #  max_connections urcat înapoi la 40 pe 2026-07-30, odată cu setarea
+  #  explicită a DB_POSTGRESDB_POOL_SIZE. Cele două trebuie citite împreună:
+  #  n8n nu deschide o conexiune pe execuție, ci ține un pool fix pe proces
+  #  (implicit 2, ceea ce a provocat incidentul din acea zi). Bugetul acum:
+  #  8 principal + 16 worker = 24, plus psql/backup și marjă. Un backend
+  #  Postgres inactiv costă ~2-3 MB, deci 40 încap în limita de 640 MB.
+  # ==========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: n8n-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=n8n
+      - POSTGRES_USER=n8n
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD lipsește din .env}
+      - TZ=Europe/Bucharest
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - max_connections=40
+      - -c
+      - effective_cache_size=512MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Fără `ports:` — accesibil doar din rețeaua Compose, niciodată de pe host
+    # sau din internet. n8n îl găsește la numele serviciului, `postgres`.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n -d n8n"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          # 512M -> 640M pe 2026-07-30, odată cu max_connections 30 -> 40.
+          memory: 640M
+
+  # ==========================================================================
+  #  Redis — brokerul de joburi pentru queue mode.
+  #
+  #  Nu stochează nimic de care să depindă corectitudinea: doar coada de joburi
+  #  între n8n principal și workeri. De aceea `--save ""` (fără persistență pe
+  #  disc) și o limită de memorie cu evacuare — dacă pică, joburile în zbor se
+  #  pierd, dar nicio dată de business.
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: n8n-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+
+volumes:
+  postgres_data:
+
+  n8n_worker_data:
+
+  n8n_data:
+    # Volum preexistent, creat înainte de Compose. `external: true` este partea
+    # critică a acestui fișier: fără el, Compose ar prefixa numele cu proiectul
+    # și ar crea un volum nou, gol — "n8n-stack_n8n_data" — iar n8n ar porni
+    # fără niciun workflow și fără nicio credențială.
+    external: true
+    name: n8n_data
+    #
+    # Pe un host nou, volumul trebuie creat înainte de `up`:
+    #     docker volume create n8n_data
+    #
+    # BACKUP — cheia de criptare a credențialelor există DOAR în
+    # /var/lib/docker/volumes/n8n_data/_data/config  (encryptionKey, 32 chars).
+    # Un backup al bazei fără acest fișier este inutil: fără cheie, toate
+    # credențialele salvate rămân nedecriptabile definitiv.
