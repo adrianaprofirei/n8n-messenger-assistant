@@ -13,3 +13,7 @@ migrate/
 
 # local tooling
 .claude/
+
+# private operational notes and prompts: keep local, never commit
+CLAUDE.md
+prompts/
