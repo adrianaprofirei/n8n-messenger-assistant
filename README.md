@@ -31,8 +31,18 @@ Roughly 84% of inbound events are delivery receipts, read receipts and echoes
 that terminate immediately — a distinction that matters a lot when sizing the
 queue and reading the metrics.
 
-Host: 2 vCPU / 3.7 GiB RAM. Every container is memory-capped; the sum is
-deliberately tracked against physical RAM.
+Totals as of 2026-11-17:
+
+| | |
+|---|---|
+| Connected pages | **98** (64 French, 30 Italian, 4 Spanish) |
+| People in conversation | **22,305** |
+| Messages stored | **218,466** |
+| Scheduled follow-ups delivered | **20,781** |
+| Executions of the main workflow | **2.2 million+** (counted since 2026-07-23) |
+
+Host: 2 vCPU / 3.7 GiB RAM, plus 2 GiB of swap. Every container is
+memory-capped; the sum is deliberately tracked against physical RAM.
 
 ## Architecture
 
